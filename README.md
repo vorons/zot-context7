@@ -16,7 +16,7 @@ go build -ldflags="-s -w" -o zot-context7 .
 zot ext install ./zot-context7
 
 # Or install directly from the repo (if published)
-zot ext install /path/to/zot-context7
+zot ext install https://github.com/vorons/zot-context7
 ```
 
 Restart zot (or run `/reload-ext`). The extension registers automatically.

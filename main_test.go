@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bufio"
 	"database/sql"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -547,4 +549,197 @@ func TestExistingDB(t *testing.T) {
 	if lib.ImportCount != 99 {
 		t.Errorf("ImportCount = %d, want 99", lib.ImportCount)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Integration test: binary handshake with simulated zot host
+// ---------------------------------------------------------------------------
+
+func TestIntegrationHandshake(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	binPath := "./zot-context7"
+	if _, err := os.Stat(binPath); os.IsNotExist(err) {
+		t.Skip("binary not found, build first: go build")
+	}
+
+	dataDir := t.TempDir()
+
+	// Pre-create config with dummy API key
+	cfgData, _ := json.Marshal(Config{
+		APIKey:            "ctx7sk-test-integration",
+		CacheTtlHours:     168,
+		DefaultTokenLimit: 5000,
+	})
+	os.WriteFile(filepath.Join(dataDir, "config.json"), cfgData, 0600)
+
+	// Start extension subprocess
+	cmd := exec.Command(binPath)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatalf("stdin pipe: %v", err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("stdout pipe: %v", err)
+	}
+
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer cmd.Process.Kill()
+
+	scanner := bufio.NewScanner(stdout)
+	enc := json.NewEncoder(stdin)
+
+	// 1. Read hello frame
+	if !scanner.Scan() {
+		t.Fatal("no hello frame")
+	}
+	var hello Frame
+	if err := json.Unmarshal([]byte(scanner.Text()), &hello); err != nil {
+		t.Fatalf("unmarshal hello: %v", err)
+	}
+	if hello["name"] != "zot-context7" {
+		t.Errorf("hello name = %v, want zot-context7", hello["name"])
+	}
+	caps, _ := hello["capabilities"].([]any)
+	hasCmds := false
+	hasTools := false
+	for _, c := range caps {
+		s, _ := c.(string)
+		if s == "commands" {
+			hasCmds = true
+		}
+		if s == "tools" {
+			hasTools = true
+		}
+	}
+	if !hasCmds || !hasTools {
+		t.Errorf("capabilities should include commands and tools, got %v", caps)
+	}
+
+	// 2. Send hello_ack
+	enc.Encode(Frame{
+		"type":    "hello_ack",
+		"data_dir": dataDir,
+	})
+
+	// 3. Read registrations + ready
+	gotCommand := false
+	gotTool := false
+	gotReady := false
+
+	for !gotReady {
+		if !scanner.Scan() {
+			t.Fatal("unexpected EOF before ready")
+		}
+		var frame Frame
+		if err := json.Unmarshal([]byte(scanner.Text()), &frame); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		switch frame["type"] {
+		case "register_command":
+			if frame["name"] == "context7" {
+				gotCommand = true
+			}
+		case "register_tool":
+			if frame["name"] == "ctx7" {
+				gotTool = true
+			}
+		case "ready":
+			gotReady = true
+		}
+	}
+
+	if !gotCommand {
+		t.Error("did not register command 'context7'")
+	}
+	if !gotTool {
+		t.Error("did not register tool 'ctx7'")
+	}
+
+	// 4. Send command_invoked: /context7 doctor
+	enc.Encode(Frame{
+		"type": "command_invoked",
+		"id":   "test-1",
+		"name": "context7",
+		"args": "doctor",
+	})
+
+	// 5. Read response
+	if !scanner.Scan() {
+		t.Fatal("no response to /context7 doctor")
+	}
+	var resp Frame
+	if err := json.Unmarshal([]byte(scanner.Text()), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if resp["type"] != "command_response" {
+		t.Errorf("response type = %v, want command_response", resp["type"])
+	}
+	if id, _ := resp["id"].(string); id != "test-1" {
+		t.Errorf("response id = %v, want test-1", id)
+	}
+	if action, _ := resp["action"].(string); action != "display" {
+		t.Errorf("response action = %v, want display", action)
+	}
+	display, _ := resp["display"].(string)
+	if !strings.Contains(display, "health check") {
+		t.Errorf("doctor response should contain 'health check', got: %s", display[:min(100, len(display))])
+	}
+	if !strings.Contains(display, "Database") {
+		t.Errorf("doctor response should mention Database, got: %s", display[:min(100, len(display))])
+	}
+
+	// 6. Send tool_call: ctx7 search
+	enc.Encode(Frame{
+		"type": "tool_call",
+		"id":   "tool-test-1",
+		"name": "ctx7",
+		"args": map[string]any{
+			"action": "search",
+			"query":  "test",
+		},
+	})
+
+	if !scanner.Scan() {
+		t.Fatal("no response to ctx7 tool_call")
+	}
+	var toolResp Frame
+	if err := json.Unmarshal([]byte(scanner.Text()), &toolResp); err != nil {
+		t.Fatalf("unmarshal tool response: %v", err)
+	}
+	if toolResp["type"] != "tool_result" {
+		t.Errorf("tool response type = %v, want tool_result", toolResp["type"])
+	}
+	if id, _ := toolResp["id"].(string); id != "tool-test-1" {
+		t.Errorf("tool response id = %v, want tool-test-1", id)
+	}
+	if isErr, _ := toolResp["is_error"].(bool); isErr {
+		content, _ := toolResp["content"].([]any)
+		t.Logf("tool error: %v", content)
+	}
+
+	// 7. Send shutdown
+	enc.Encode(Frame{"type": "shutdown"})
+	if scanner.Scan() {
+		var ack Frame
+		json.Unmarshal([]byte(scanner.Text()), &ack)
+		if ack["type"] != "shutdown_ack" {
+			t.Errorf("expected shutdown_ack, got %v", ack["type"])
+		}
+	}
+
+	cmd.Wait()
+	t.Logf("Integration handshake: OK (command=%v, tool=%v)", gotCommand, gotTool)
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
