@@ -1,0 +1,8 @@
+{
+  "name": "zot-context7",
+  "version": "1.0.0",
+  "exec": "./zot-context7",
+  "language": "go",
+  "description": "Search Context7 documentation cache — /context7 command + ctx7 LLM tool",
+  "enabled": true
+}
