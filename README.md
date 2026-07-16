@@ -127,17 +127,10 @@ Returns markdown-formatted documentation and code examples.
         └── Return formatted markdown
 ```
 
-- **Cache location:** `~/.context7-cache/docs.db` (shared with npm `context7-skill`)
+- **Cache location:** `~/.context7-cache/docs.db`
 - **TTL:** Configurable via `config.json` (default 7 days)
 - **Full-text search:** FTS5 when available, `LIKE` fallback otherwise
 - **Token tracking:** Every request is logged in `token_stats` for hit rate analysis
-
-## Cache compatibility
-
-The database schema is identical to npm `context7-skill` v0.1.2.
-Existing `.context7-cache/docs.db` files are read directly — no migration or
-import step required. The WAL journal mode allows safe concurrent access when
-the npm tool and zot are not running simultaneously.
 
 ## Commands reference
 
