@@ -39,6 +39,9 @@ Create `config.json` in the extension's data directory
 }
 ```
 
+The API key is **optional**. Without it, requests go to Context7 unauthenticated
+with lower rate limits. With a key, you get higher limits.
+
 The API key can also be set via the `CONTEXT7_API_KEY` environment variable.
 Config file takes precedence.
 
@@ -116,7 +119,7 @@ The tool returns markdown-formatted documentation and code examples.
         │   no
         │
         ├── Resolve library name (DB → API)
-        ├── Fetch from Context7 API (if key configured)
+        ├── Fetch from Context7 API (key optional — unauthenticated with rate limits)
         ├── Store in query_cache + snippets + FTS index
         └── Return formatted markdown
 ```

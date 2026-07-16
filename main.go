@@ -627,7 +627,7 @@ func resolveLibraryID(db *dbWrap, api *apiClient, name string) (string, string, 
 		}
 	}
 
-	if api != nil && api.apiKey != "" {
+	if api != nil {
 		results, err := api.searchLibrary(name, "")
 		if err == nil && len(results) > 0 {
 			return results[0].ID, results[0].Title, nil
@@ -974,7 +974,7 @@ func handleDocs(ctx *commandCtx, args []string) {
 	}
 
 	// Fetch from API
-	if ctx.api == nil || ctx.api.apiKey == "" {
+	if ctx.api == nil {
 		// Offline: try to serve any cached content
 		if ctx.db != nil {
 			rows, err := ctx.db.Query("SELECT title, content FROM snippets WHERE library_id=? LIMIT 20", libID)
@@ -998,7 +998,7 @@ func handleDocs(ctx *commandCtx, args []string) {
 				}
 			}
 		}
-		ctx.respond("API key not configured and no cached docs available.\nSet `apiKey` in the extension's `config.json` or `CONTEXT7_API_KEY` env var.")
+		ctx.respond("API not available and no cached docs found.")
 		return
 	}
 
@@ -1108,15 +1108,18 @@ func handleDoctor(ctx *commandCtx) {
 	}
 
 	// 2. API auth
-	if ctx.api != nil && ctx.api.apiKey != "" {
-		b.WriteString("✅ **API key:** configured\n")
+	if ctx.api != nil {
+		if ctx.api.apiKey != "" {
+			b.WriteString("✅ **API key:** configured\n")
+		} else {
+			b.WriteString("⚠️ **API key:** not set (unauthenticated, rate-limited)\n")
+		}
 	} else {
-		b.WriteString("❌ **API key:** not set\n")
-		b.WriteString("   Set `apiKey` in `config.json` or `CONTEXT7_API_KEY` env var.\n")
+		b.WriteString("❌ **API:** not available\n")
 	}
 
 	// 3. API reachability
-	if ctx.api != nil && ctx.api.apiKey != "" {
+	if ctx.api != nil {
 		if err := ctx.api.ping(); err != nil {
 			b.WriteString(fmt.Sprintf("❌ **API reachability:** %v\n", err))
 		} else {
@@ -1215,7 +1218,7 @@ func handleToolDocs(ctx *commandCtx, toolID, library, query string) {
 	}
 
 	// Fetch from API
-	if ctx.api == nil || ctx.api.apiKey == "" {
+	if ctx.api == nil {
 		if ctx.db != nil {
 			rows, err := ctx.db.Query("SELECT title, content FROM snippets WHERE library_id=? LIMIT 20", libID)
 			if err == nil {
@@ -1238,7 +1241,7 @@ func handleToolDocs(ctx *commandCtx, toolID, library, query string) {
 				}
 			}
 		}
-		ctx.toolResult(toolID, "API key not configured and no cached docs available.", true)
+		ctx.toolResult(toolID, "API not available and no cached docs found.", true)
 		return
 	}
 
@@ -1369,11 +1372,8 @@ func main() {
 				// Load config from extension's data dir
 				cfg = loadConfig(dataDir)
 
-				// API client
-				apiKey := resolveAPIKey(cfg)
-				if apiKey != "" {
-					api = newAPIClient(apiKey)
-				}
+				// API client (key is optional — unauthenticated requests work with rate limits)
+				api = newAPIClient(resolveAPIKey(cfg))
 
 				// Cache directory: ~/.context7-cache (shared with npm context7-skill)
 				cacheDir = homeCacheDir()
