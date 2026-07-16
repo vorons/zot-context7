@@ -4,9 +4,6 @@
 [Context7](https://context7.com) documentation API with a local SQLite cache.
 It provides a `/context7` slash command and a `ctx7` LLM-callable tool.
 
-The cache is compatible with the npm `context7-skill` package — both tools
-share `~/.context7-cache/docs.db` transparently. No import or conversion needed.
-
 ## Installation
 
 ```bash
@@ -92,19 +89,25 @@ Config file takes precedence.
 
 ### LLM tool: `ctx7`
 
+> *Fetch up-to-date docs and code examples for any library or framework.
+> Call before implementing anything involving a third-party dependency.*
+
 The agent can call `ctx7` directly with two actions:
 
-**`search`** — find libraries matching a topic:
+**`search`** — find libraries matching a topic or task:
 ```json
 {"action": "search", "query": "react hooks"}
 ```
 
-**`docs`** — get documentation for a specific library:
+**`docs`** — fetch docs and code examples for a specific library:
 ```json
 {"action": "docs", "library": "lodash", "query": "deep merge objects"}
 ```
 
-The tool returns markdown-formatted documentation and code examples.
+The `library` parameter accepts a package name or Context7 ID (e.g. `/facebook/react`).
+The `query` parameter should be a specific topic or question — narrow queries return better results.
+
+Returns markdown-formatted documentation and code examples.
 
 ## How it works
 
