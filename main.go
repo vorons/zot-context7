@@ -1397,22 +1397,22 @@ func main() {
 				emit(Frame{
 					"type":        "register_tool",
 					"name":        "ctx7",
-					"description": "Search documentation and code examples from the Context7 documentation cache. Use 'search' to find relevant libraries, 'docs' to get specific documentation with code examples.",
+					"description": "Fetch up-to-date docs and code examples for any library or framework. Call before implementing anything involving a third-party dependency.",
 					"schema": map[string]any{
 						"type": "object",
 						"properties": map[string]any{
 							"action": map[string]any{
 								"type":        "string",
 								"enum":        []string{"search", "docs"},
-								"description": "'search' finds libraries matching a topic; 'docs' returns documentation and code for a specific library",
+								"description": "Find libraries matching a topic or task. Returns names and IDs — use the ID with 'docs' action next.",
 							},
 							"library": map[string]any{
 								"type":        "string",
-								"description": "Library name (e.g. 'lodash', 'fastapi', 'react'). Required for 'docs' action.",
+								"description": "Library name or Context7 ID (e.g. 'react', '/facebook/react'). Required for 'docs'.",
 							},
 							"query": map[string]any{
 								"type":        "string",
-								"description": "What to search for or ask about the library",
+								"description": "Specific topic or question — narrow queries return better results.",
 							},
 						},
 						"required": []string{"action", "query"},
