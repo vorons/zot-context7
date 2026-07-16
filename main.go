@@ -477,7 +477,7 @@ type apiLibResult struct {
 	Title          string   `json:"title"`
 	Description    string   `json:"description"`
 	TotalSnippets  int      `json:"totalSnippets"`
-	TrustScore     int      `json:"trustScore"`
+	TrustScore     float64  `json:"trustScore"`
 	BenchmarkScore float64  `json:"benchmarkScore"`
 	Versions       []string `json:"versions"`
 }
@@ -719,6 +719,25 @@ func formatSearchResults(results []resultRow, query string) string {
 	return b.String()
 }
 
+// formatAPISearchResults formats Context7 API library search results as markdown.
+func formatAPISearchResults(results []apiLibResult, query string) string {
+	if len(results) == 0 {
+		return "No results found."
+	}
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("Found **%d** libraries for \"%s\":\n\n", len(results), query))
+	for _, r := range results {
+		desc := r.Description
+		if len(desc) > 120 {
+			desc = desc[:120] + "..."
+		}
+		b.WriteString(fmt.Sprintf("- **%s** (`%s`) — score %.0f, %d snippets\n  %s\n",
+			r.Title, r.ID, r.BenchmarkScore, r.TotalSnippets, desc))
+	}
+	b.WriteString("\nUse `ctx7` docs action with the library ID to fetch documentation.")
+	return b.String()
+}
+
 // ---------------------------------------------------------------------------
 // Command handler
 // ---------------------------------------------------------------------------
@@ -884,24 +903,36 @@ func handleSearch(ctx *commandCtx, args []string) {
 		return
 	}
 
-	if ctx.db == nil {
-		ctx.respond("No cache found. Use `docs` to populate the cache first.")
-		return
+	// 1. Try local DB first
+	if ctx.db != nil {
+		results, err := ctx.db.searchFTS(query, limit)
+		if err == nil && len(results) > 0 {
+			if jsonOut {
+				data, _ := json.MarshalIndent(results, "", "  ")
+				ctx.respond(string(data))
+				return
+			}
+			ctx.respond(formatSearchResults(results, query))
+			return
+		}
 	}
 
-	results, err := ctx.db.searchFTS(query, limit)
+	// 2. Fallback: search Context7 API for libraries
+	if ctx.api == nil {
+		ctx.respond("No cache and API is unreachable.")
+		return
+	}
+	apiResults, err := ctx.api.searchLibrary(query, query)
 	if err != nil {
 		ctx.respond("Search error: " + err.Error())
 		return
 	}
-
 	if jsonOut {
-		data, _ := json.MarshalIndent(results, "", "  ")
+		data, _ := json.MarshalIndent(apiResults, "", "  ")
 		ctx.respond(string(data))
 		return
 	}
-
-	ctx.respond(formatSearchResults(results, query))
+	ctx.respond(formatAPISearchResults(apiResults, query))
 }
 
 // ---------------------------------------------------------------------------
@@ -1174,16 +1205,30 @@ func handleTool(ctx *commandCtx, toolID string, args map[string]any) {
 }
 
 func handleToolSearch(ctx *commandCtx, toolID, query string) {
-	if ctx.db == nil {
-		ctx.toolResult(toolID, "No cache available. Use `docs` action first to populate the cache.", true)
+	// 1. Try local DB first
+	if ctx.db != nil {
+		results, err := ctx.db.searchFTS(query, 20)
+		if err == nil && len(results) > 0 {
+			ctx.toolResult(toolID, formatSearchResults(results, query), false)
+			return
+		}
+	}
+
+	// 2. Fallback: search Context7 API for libraries
+	if ctx.api == nil {
+		ctx.toolResult(toolID, "No cache available and API is unreachable.", true)
 		return
 	}
-	results, err := ctx.db.searchFTS(query, 20)
+	apiResults, err := ctx.api.searchLibrary(query, query)
 	if err != nil {
 		ctx.toolResult(toolID, "Search error: "+err.Error(), true)
 		return
 	}
-	ctx.toolResult(toolID, formatSearchResults(results, query), false)
+	if len(apiResults) == 0 {
+		ctx.toolResult(toolID, formatSearchResults(nil, query), false)
+		return
+	}
+	ctx.toolResult(toolID, formatAPISearchResults(apiResults, query), false)
 }
 
 func handleToolDocs(ctx *commandCtx, toolID, library, query string) {
