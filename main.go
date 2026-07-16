@@ -1378,7 +1378,7 @@ func main() {
 	emit(Frame{
 		"type":         "hello",
 		"name":         "zot-context7",
-		"version":      "1.1.0",
+		"version":      "1.1.1",
 		"capabilities": []string{"commands", "tools"},
 	})
 
