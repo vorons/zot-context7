@@ -75,7 +75,9 @@ func loadConfig(dataDir string) *Config {
 	if err != nil {
 		return cfg
 	}
-	json.Unmarshal(data, cfg)
+	if err := json.Unmarshal(data, cfg); err != nil {
+		notify("warn", "config.json is malformed, using defaults: "+err.Error())
+	}
 	return cfg
 }
 
@@ -264,8 +266,13 @@ func (w *dbWrap) searchFTS(query string, limit int) ([]resultRow, error) {
 	}
 
 	if w.hasFTS {
+		words := strings.Fields(escapeFTSQuery(safe))
+		if len(words) == 0 {
+			return nil, nil
+		}
+		ftsQuery := strings.Join(words, " *") + " *"
 		rows, err := w.Query(`SELECT library_name, library_id, title, content, query, rank
-			FROM docs_fts WHERE docs_fts MATCH ? ORDER BY rank LIMIT ?`, "\""+safe+"\"*", limit)
+			FROM docs_fts WHERE docs_fts MATCH ? ORDER BY rank LIMIT ?`, ftsQuery, limit)
 		if err == nil {
 			defer rows.Close()
 			var out []resultRow
@@ -329,7 +336,7 @@ func isCacheFresh(c *cacheRow) bool {
 
 func (w *dbWrap) storeQueryCache(libraryID, query, resultJSON string, ttlHours int) {
 	now := time.Now().UTC().Format(time.RFC3339)
-	w.Exec(`INSERT OR REPLACE INTO query_cache (library_id, query, result_json, fetched_at, ttl_hours)
+	w.execLog(`INSERT OR REPLACE INTO query_cache (library_id, query, result_json, fetched_at, ttl_hours)
 		VALUES (?, ?, ?, ?, ?)`, libraryID, query, resultJSON, now, ttlHours)
 }
 
@@ -347,18 +354,20 @@ func (w *dbWrap) storeSnippets(libraryName, libraryID, query string, snippets []
 		if !w.hasFTS {
 			return
 		}
-		w.Exec("INSERT INTO docs_fts (library_name, library_id, title, content, query) VALUES (?, ?, ?, ?, ?)",
+		w.execLog("INSERT INTO docs_fts (library_name, library_id, title, content, query) VALUES (?, ?, ?, ?, ?)",
 			libraryName, libraryID, title, content, query)
 	}
 
 	for _, s := range snippets {
-		ins.Exec(libraryID, s.Title, s.Content, s.SourceURL, query, s.Tokens, now)
+		if _, err := ins.Exec(libraryID, s.Title, s.Content, s.SourceURL, query, s.Tokens, now); err != nil {
+			notify("error", "store snippet: "+err.Error())
+		}
 		insFTS(s.Title, s.Content)
 	}
 }
 
 func (w *dbWrap) upsertLibrary(lib libRow) {
-	w.Exec(`INSERT OR REPLACE INTO libraries (id, name, description, total_snippets, trust_score, benchmark_score, versions, pinned_version, source_file, dep_name, import_count, last_fetched)
+	w.execLog(`INSERT OR REPLACE INTO libraries (id, name, description, total_snippets, trust_score, benchmark_score, versions, pinned_version, source_file, dep_name, import_count, last_fetched)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		lib.ID, lib.Name, lib.Description, lib.TotalSnippets, lib.TrustScore,
 		lib.BenchmarkScore, lib.Versions, lib.PinnedVersion, lib.SourceFile,
@@ -392,17 +401,20 @@ func (w *dbWrap) recordTokenStat(libraryID, query string, tokens int, cacheHit b
 	if cacheHit {
 		hit = 1
 	}
-	w.Exec("INSERT INTO token_stats (library_id, query, tokens_served, was_cache_hit, timestamp) VALUES (?, ?, ?, ?, ?)",
+	w.execLog("INSERT INTO token_stats (library_id, query, tokens_served, was_cache_hit, timestamp) VALUES (?, ?, ?, ?, ?)",
 		libraryID, query, tokens, hit, time.Now().UTC().Format(time.RFC3339))
 }
 
+// Rough estimate: ~$3/M input tokens for Claude.
+const tokenCostPerMillion = 3.0
+
 type tokenStats struct {
-	TotalTokens     int     `json:"totalTokens"`
-	CachedTokens    int     `json:"cachedTokens"`
-	CacheHits       int     `json:"cacheHits"`
-	APICalls        int     `json:"apiCalls"`
-	HitRate         float64 `json:"hitRate"`
-	EstimatedDollars string `json:"estimatedSavings"`
+	TotalTokens      int     `json:"totalTokens"`
+	CachedTokens     int     `json:"cachedTokens"`
+	CacheHits        int     `json:"cacheHits"`
+	APICalls         int     `json:"apiCalls"`
+	HitRate          float64 `json:"hitRate"`
+	EstimatedSavings string  `json:"estimatedSavings"`
 }
 
 func (w *dbWrap) getTokenStats() *tokenStats {
@@ -422,8 +434,7 @@ func (w *dbWrap) getTokenStats() *tokenStats {
 		hitRate = float64(hits) / float64(totalCalls)
 	}
 
-	// Rough estimate: $3/M input tokens for Claude.
-	savedDollars := (float64(cachedTokens) / 1_000_000) * 3
+	savedDollars := (float64(cachedTokens) / 1_000_000) * tokenCostPerMillion
 
 	return &tokenStats{
 		TotalTokens:      total,
@@ -431,25 +442,30 @@ func (w *dbWrap) getTokenStats() *tokenStats {
 		CacheHits:        hits,
 		APICalls:         misses,
 		HitRate:          hitRate,
-		EstimatedDollars: fmt.Sprintf("$%.4f", savedDollars),
+		EstimatedSavings: fmt.Sprintf("$%.4f", savedDollars),
 	}
 }
 
 func (w *dbWrap) clearCache() {
-	w.Exec("DELETE FROM docs_fts")
-	w.Exec("DELETE FROM snippets")
-	w.Exec("DELETE FROM query_cache")
-	w.Exec("DELETE FROM libraries")
-	w.Exec("DELETE FROM token_stats")
+	w.execLog("DELETE FROM docs_fts")
+	w.execLog("DELETE FROM snippets")
+	w.execLog("DELETE FROM query_cache")
+	w.execLog("DELETE FROM libraries")
+	w.execLog("DELETE FROM token_stats")
 }
 
 func (w *dbWrap) dbSize() string {
 	var size int64
-	w.QueryRow("SELECT IFNULL(SUM(pgsize), 0) FROM dbstat").Scan(&size)
+	if err := w.QueryRow("SELECT IFNULL(SUM(pgsize), 0) FROM dbstat").Scan(&size); err != nil {
+		notify("warn", "dbstat not available, falling back to file size: "+err.Error())
+	}
 	if size == 0 {
 		// fallback: use file size
 		var p string
-		w.QueryRow("PRAGMA database_list").Scan(nil, nil, &p)
+		if err := w.QueryRow("PRAGMA database_list").Scan(nil, nil, &p); err != nil {
+			notify("error", "failed to get database path: "+err.Error())
+			return "?"
+		}
 		if fi, err := os.Stat(p); err == nil {
 			size = fi.Size()
 		}
@@ -807,16 +823,11 @@ Subcommands:
 func handleLibs(ctx *commandCtx, args []string) {
 	// Parse --json
 	jsonOut := ctx.jsonOut
-	remain := args[:0]
 	for _, a := range args {
-		switch a {
-		case "--json":
+		if a == "--json" {
 			jsonOut = true
-		default:
-			remain = append(remain, a)
 		}
 	}
-	_ = remain
 
 	if ctx.db == nil {
 		ctx.respond("No cache found. Use `docs` to populate the cache.")
@@ -875,25 +886,24 @@ func handleSearch(ctx *commandCtx, args []string) {
 	jsonOut := ctx.jsonOut
 	var queryParts []string
 
-	for _, a := range args {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
 		switch {
 		case a == "--json":
 			jsonOut = true
+		case a == "--limit" && i+1 < len(args):
+			n, err := fmt.Sscanf(args[i+1], "%d", &limit)
+			if err != nil || n != 1 {
+				notify("warn", "invalid --limit value: "+args[i+1])
+			}
+			i++ // skip next arg
 		case strings.HasPrefix(a, "--limit="):
-			fmt.Sscanf(a, "--limit=%d", &limit)
-		case a == "--limit" && len(queryParts) == 0:
-			// limit as next arg — handled by iterating twice,
-			// but we use single pass; we'll handle this differently
+			n, err := fmt.Sscanf(a, "--limit=%d", &limit)
+			if err != nil || n != 1 {
+				notify("warn", "invalid --limit value: "+a)
+			}
 		default:
 			queryParts = append(queryParts, a)
-		}
-	}
-
-	// Handle --limit N as next arg
-	for i := 0; i < len(args)-1; i++ {
-		if args[i] == "--limit" {
-			fmt.Sscanf(args[i+1], "%d", &limit)
-			break
 		}
 	}
 
@@ -945,24 +955,26 @@ func handleDocs(ctx *commandCtx, args []string) {
 	tokens := 0
 	var posArgs []string
 
-	for _, a := range args {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
 		switch {
 		case a == "--no-cache":
 			noCache = true
 		case a == "--json":
 			jsonOut = true
+		case a == "--tokens" && i+1 < len(args):
+			n, err := fmt.Sscanf(args[i+1], "%d", &tokens)
+			if err != nil || n != 1 {
+				notify("warn", "invalid --tokens value: "+args[i+1])
+			}
+			i++ // skip next arg
 		case strings.HasPrefix(a, "--tokens="):
-			fmt.Sscanf(a, "--tokens=%d", &tokens)
+			n, err := fmt.Sscanf(a, "--tokens=%d", &tokens)
+			if err != nil || n != 1 {
+				notify("warn", "invalid --tokens value: "+a)
+			}
 		default:
 			posArgs = append(posArgs, a)
-		}
-	}
-
-	// Handle --tokens N as separate args
-	for i := 0; i < len(args)-1; i++ {
-		if args[i] == "--tokens" {
-			fmt.Sscanf(args[i+1], "%d", &tokens)
-			break
 		}
 	}
 
@@ -974,60 +986,31 @@ func handleDocs(ctx *commandCtx, args []string) {
 	library := posArgs[0]
 	query := strings.Join(posArgs[1:], " ")
 
-	// Resolve library ID
 	libID, libName, err := resolveLibraryID(ctx.db, ctx.api, library)
 	if err != nil {
 		ctx.respond(fmt.Sprintf("Error: %v", err))
 		return
 	}
 
-	// ponytail: TTL from config if available
-	ttlHours := 168
-	if ctx.cfg != nil && ctx.cfg.CacheTtlHours > 0 {
-		ttlHours = ctx.cfg.CacheTtlHours
-	}
+	ttlHours := ctx.effectiveTTL()
 
-	// Check cache (unless --no-cache)
-	if !noCache && ctx.db != nil {
-		if cached := ctx.db.getCachedQuery(libID, query); cached != nil && isCacheFresh(cached) {
-			var docs docsResponse
-			if err := json.Unmarshal([]byte(cached.ResultJSON), &docs); err == nil {
-				tokenCount := len(cached.ResultJSON)
-				ctx.db.recordTokenStat(libID, query, tokenCount, true)
-				if jsonOut {
-					ctx.respondJSON(docs)
-				} else {
-					ctx.respond(formatDocs(libName, &docs))
-				}
-				return
+	// Cache hit?
+	if !noCache {
+		if docs, ok := ctx.tryCachedDocs(libID, query); ok {
+			if jsonOut {
+				ctx.respondJSON(docs)
+			} else {
+				ctx.respond(formatDocs(libName, docs))
 			}
+			return
 		}
 	}
 
-	// Fetch from API
+	// Offline fallback
 	if ctx.api == nil {
-		// Offline: try to serve any cached content
-		if ctx.db != nil {
-			rows, err := ctx.db.Query("SELECT title, content FROM snippets WHERE library_id=? LIMIT 20", libID)
-			if err == nil {
-				var snippets []snippet
-				for rows.Next() {
-					var s snippet
-					if rows.Scan(&s.Title, &s.Content) == nil {
-						snippets = append(snippets, s)
-					}
-				}
-				rows.Close()
-				if len(snippets) > 0 {
-					var b strings.Builder
-					b.WriteString(fmt.Sprintf("**[OFFLINE] Cached docs for %s**\n\n", libName))
-					for _, s := range snippets {
-						b.WriteString(fmt.Sprintf("### %s\n%s\n\n", s.Title, s.Content))
-					}
-					ctx.respond(b.String())
-					return
-				}
-			}
+		if text := ctx.offlineSnippetText(libID, libName); text != "" {
+			ctx.respond(text)
+			return
 		}
 		ctx.respond("API not available and no cached docs found.")
 		return
@@ -1039,28 +1022,7 @@ func handleDocs(ctx *commandCtx, args []string) {
 		return
 	}
 
-	// Cache the result
-	if ctx.db != nil {
-		resultJSON, _ := json.Marshal(docs)
-		ctx.db.storeQueryCache(libID, query, string(resultJSON), ttlHours)
-
-		ss := snippetsFromDocs(libID, query, docs)
-		ctx.db.storeSnippets(libName, libID, query, ss)
-
-		if ctx.db.getLibrary(libID) == nil {
-			ctx.db.upsertLibrary(libRow{
-				ID:            libID,
-				Name:          libName,
-				TotalSnippets: intPtr(len(ss)),
-				DepName:       &library,
-				ImportCount:   0,
-				LastFetched:   strPtr(time.Now().UTC().Format(time.RFC3339)),
-			})
-		}
-
-		tokenCount := len(resultJSON)
-		ctx.db.recordTokenStat(libID, query, tokenCount, false)
-	}
+	ctx.storeDocsCache(libID, query, libName, ttlHours, docs)
 
 	if jsonOut {
 		ctx.respondJSON(docs)
@@ -1106,7 +1068,7 @@ func handleCacheStats(ctx *commandCtx) {
 	b.WriteString(fmt.Sprintf("- **API calls:** %d\n", stats.APICalls))
 	b.WriteString(fmt.Sprintf("- **Cached tokens saved:** %d\n", stats.CachedTokens))
 	b.WriteString(fmt.Sprintf("- **Hit rate:** %.1f%%\n", stats.HitRate*100))
-	b.WriteString(fmt.Sprintf("- **Estimated savings:** %s\n", stats.EstimatedDollars))
+	b.WriteString(fmt.Sprintf("- **Estimated savings:** %s\n", stats.EstimatedSavings))
 	ctx.respond(b.String())
 }
 
@@ -1232,59 +1194,30 @@ func handleToolSearch(ctx *commandCtx, toolID, query string) {
 }
 
 func handleToolDocs(ctx *commandCtx, toolID, library, query string) {
-	noCache := false
 	tokens := 0
 	if ctx.cfg != nil {
 		tokens = ctx.cfg.DefaultTokenLimit
 	}
 
-	// Resolve library ID
 	libID, libName, err := resolveLibraryID(ctx.db, ctx.api, library)
 	if err != nil {
 		ctx.toolResult(toolID, fmt.Sprintf("Error: %v", err), true)
 		return
 	}
 
-	ttlHours := 168
-	if ctx.cfg != nil && ctx.cfg.CacheTtlHours > 0 {
-		ttlHours = ctx.cfg.CacheTtlHours
+	ttlHours := ctx.effectiveTTL()
+
+	// Cache hit?
+	if docs, ok := ctx.tryCachedDocs(libID, query); ok {
+		ctx.toolResult(toolID, formatDocs(libName, docs), false)
+		return
 	}
 
-	// Check cache
-	if !noCache && ctx.db != nil {
-		if cached := ctx.db.getCachedQuery(libID, query); cached != nil && isCacheFresh(cached) {
-			var docs docsResponse
-			if err := json.Unmarshal([]byte(cached.ResultJSON), &docs); err == nil {
-				ctx.db.recordTokenStat(libID, query, len(cached.ResultJSON), true)
-				ctx.toolResult(toolID, formatDocs(libName, &docs), false)
-				return
-			}
-		}
-	}
-
-	// Fetch from API
+	// Offline fallback
 	if ctx.api == nil {
-		if ctx.db != nil {
-			rows, err := ctx.db.Query("SELECT title, content FROM snippets WHERE library_id=? LIMIT 20", libID)
-			if err == nil {
-				var snippets []snippet
-				for rows.Next() {
-					var s snippet
-					if rows.Scan(&s.Title, &s.Content) == nil {
-						snippets = append(snippets, s)
-					}
-				}
-				rows.Close()
-				if len(snippets) > 0 {
-					var b strings.Builder
-					b.WriteString(fmt.Sprintf("**[OFFLINE] Cached docs for %s**\n\n", libName))
-					for _, s := range snippets {
-						b.WriteString(fmt.Sprintf("### %s\n%s\n\n", s.Title, s.Content))
-					}
-					ctx.toolResult(toolID, b.String(), false)
-					return
-				}
-			}
+		if text := ctx.offlineSnippetText(libID, libName); text != "" {
+			ctx.toolResult(toolID, text, false)
+			return
 		}
 		ctx.toolResult(toolID, "API not available and no cached docs found.", true)
 		return
@@ -1296,23 +1229,7 @@ func handleToolDocs(ctx *commandCtx, toolID, library, query string) {
 		return
 	}
 
-	// Cache
-	if ctx.db != nil {
-		resultJSON, _ := json.Marshal(docs)
-		ctx.db.storeQueryCache(libID, query, string(resultJSON), ttlHours)
-		ss := snippetsFromDocs(libID, query, docs)
-		ctx.db.storeSnippets(libName, libID, query, ss)
-		if ctx.db.getLibrary(libID) == nil {
-			ctx.db.upsertLibrary(libRow{
-				ID:          libID,
-				Name:        libName,
-				DepName:     &library,
-				LastFetched: strPtr(time.Now().UTC().Format(time.RFC3339)),
-			})
-		}
-		ctx.db.recordTokenStat(libID, query, len(resultJSON), false)
-	}
-
+	ctx.storeDocsCache(libID, query, libName, ttlHours, docs)
 	ctx.toolResult(toolID, formatDocs(libName, docs), false)
 }
 
@@ -1371,6 +1288,119 @@ func intPtr(n int) *int { return &n }
 func strPtr(s string) *string { return &s }
 
 // ---------------------------------------------------------------------------
+// DB exec with error logging
+// ---------------------------------------------------------------------------
+
+func (w *dbWrap) execLog(query string, args ...any) {
+	if _, err := w.Exec(query, args...); err != nil {
+		notify("error", fmt.Sprintf("DB write: %v", err))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// FTS5 query escaping
+// ---------------------------------------------------------------------------
+
+// escapeFTSQuery strips FTS5 special characters from a user query so it can
+// be used safely as a prefix-phrase match.
+func escapeFTSQuery(q string) string {
+	return strings.NewReplacer(
+		"'", "", `"`, "", `*`, "", `(`, "", `)`, "", `^`, "",
+		`~`, "", `+`, "", `-`, "", `:`, "",
+	).Replace(q)
+}
+
+// ---------------------------------------------------------------------------
+// commandCtx helpers for docs fetch & cache
+// ---------------------------------------------------------------------------
+
+// storeDocsCache persists API docs into the DB cache.
+func (ctx *commandCtx) storeDocsCache(libID, query, libName string, ttlHours int, docs *docsResponse) {
+	if ctx.db == nil {
+		return
+	}
+	resultJSON, err := json.Marshal(docs)
+	if err != nil {
+		notify("error", "failed to marshal docs for cache: "+err.Error())
+		return
+	}
+	ctx.db.storeQueryCache(libID, query, string(resultJSON), ttlHours)
+	ss := snippetsFromDocs(libID, query, docs)
+	ctx.db.storeSnippets(libName, libID, query, ss)
+	if ctx.db.getLibrary(libID) == nil {
+		depName := libName
+		ctx.db.upsertLibrary(libRow{
+			ID:            libID,
+			Name:          libName,
+			TotalSnippets: intPtr(len(ss)),
+			DepName:       &depName,
+			ImportCount:   0,
+			LastFetched:   strPtr(time.Now().UTC().Format(time.RFC3339)),
+		})
+	}
+	ctx.db.recordTokenStat(libID, query, len(resultJSON), false)
+}
+
+// offlineSnippetText returns formatted markdown from cached snippets when the
+// API is unavailable. Returns empty string if no offline data is available.
+func (ctx *commandCtx) offlineSnippetText(libID, libName string) string {
+	if ctx.db == nil {
+		return ""
+	}
+	rows, err := ctx.db.Query("SELECT title, content FROM snippets WHERE library_id=? LIMIT 20", libID)
+	if err != nil {
+		notify("error", "offline snippet query: "+err.Error())
+		return ""
+	}
+	defer rows.Close()
+	var snippets []snippet
+	for rows.Next() {
+		var s snippet
+		if rows.Scan(&s.Title, &s.Content) == nil {
+			snippets = append(snippets, s)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		notify("error", "reading offline snippets: "+err.Error())
+	}
+	if len(snippets) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("**[OFFLINE] Cached docs for %s**\n\n", libName))
+	for _, s := range snippets {
+		b.WriteString(fmt.Sprintf("### %s\n%s\n\n", s.Title, s.Content))
+	}
+	return b.String()
+}
+
+// tryCachedDocs checks the query cache and returns the cached docs if fresh.
+// Returns (docs, true) on cache hit, (nil, false) otherwise.
+func (ctx *commandCtx) tryCachedDocs(libID, query string) (*docsResponse, bool) {
+	if ctx.db == nil {
+		return nil, false
+	}
+	cached := ctx.db.getCachedQuery(libID, query)
+	if cached == nil || !isCacheFresh(cached) {
+		return nil, false
+	}
+	var docs docsResponse
+	if err := json.Unmarshal([]byte(cached.ResultJSON), &docs); err != nil {
+		return nil, false
+	}
+	ctx.db.recordTokenStat(libID, query, len(cached.ResultJSON), true)
+	return &docs, true
+}
+
+// effectiveTTL returns the configured cache TTL in hours, defaulting to 168 (7 days).
+func (ctx *commandCtx) effectiveTTL() int {
+	if ctx.cfg != nil && ctx.cfg.CacheTtlHours > 0 {
+		return ctx.cfg.CacheTtlHours
+	}
+	return 168
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -1378,7 +1408,7 @@ func main() {
 	emit(Frame{
 		"type":         "hello",
 		"name":         "zot-context7",
-		"version":      "1.1.1",
+		"version":      "1.2.0",
 		"capabilities": []string{"commands", "tools"},
 	})
 
@@ -1388,7 +1418,6 @@ func main() {
 		cfg      *Config
 		cacheDir string
 		dataDir  string
-		ready    bool
 	)
 
 	frames := readFrames()
@@ -1442,22 +1471,22 @@ func main() {
 				emit(Frame{
 					"type":        "register_tool",
 					"name":        "ctx7",
-					"description": "Fetch up-to-date docs and code examples for any library or framework. Call before implementing anything involving a third-party dependency.",
+					"description": "Search and retrieve documentation for any library or framework. Cache-first (SQLite): repeated calls are instant. Use 'search' to find libraries, then 'docs' to get code examples. Always call before implementing anything with a third-party dependency.",
 					"schema": map[string]any{
 						"type": "object",
 						"properties": map[string]any{
 							"action": map[string]any{
 								"type":        "string",
 								"enum":        []string{"search", "docs"},
-								"description": "Find libraries matching a topic or task. Returns names and IDs — use the ID with 'docs' action next.",
+								"description": "Action to perform: 'search' finds libraries matching a topic; 'docs' retrieves documentation and code examples for a specific library (requires 'library' parameter).",
 							},
 							"library": map[string]any{
 								"type":        "string",
-								"description": "Library name or Context7 ID (e.g. 'react', '/facebook/react'). Required for 'docs'.",
+								"description": "Library name or Context7 ID (e.g. 'react', '/facebook/react'). Required for 'docs' action.",
 							},
 							"query": map[string]any{
 								"type":        "string",
-								"description": "Specific topic or question — narrow queries return better results.",
+								"description": "Search query or documentation topic. Narrow queries return better results.",
 							},
 						},
 						"required": []string{"action", "query"},
@@ -1465,15 +1494,13 @@ func main() {
 				})
 
 				emit(Frame{"type": "ready"})
-				ready = true
 
 			// ---- /context7 slash command ----
 			case "command_invoked":
 				id, _ := msg["id"].(string)
 				args, _ := msg["args"].(string)
 
-				// Save config if apiKey was passed
-				_ = saveConfig // keep saveConfig accessible
+				// saveConfig is available for config commands
 
 				ctx := &commandCtx{
 					id:       id,
@@ -1513,8 +1540,7 @@ func main() {
 				return
 			}
 
-			// Delay DB close if we need it for further commands
-			_ = ready
+
 		}
 	}
 }
