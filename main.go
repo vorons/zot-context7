@@ -1471,25 +1471,25 @@ func main() {
 				emit(Frame{
 					"type":        "register_tool",
 					"name":        "ctx7",
-					"description": "Search and retrieve documentation for any library or framework. Cache-first (SQLite): repeated calls are instant. Use 'search' to find libraries, then 'docs' to get code examples. Always call before implementing anything with a third-party dependency.",
+					"description": "Search and retrieve documentation for any library or framework. Cache-first (SQLite): repeated calls are instant and free. Returns markdown-formatted documentation, code examples, or library search results. Always call before implementing anything with a third-party dependency.\n\nWorkflow:\n  1. `search` — find what's available (local FTS cache, falls back to API library search)\n  2. `docs` — fetch full docs + code examples for a specific library (requires `library`)",
 					"schema": map[string]any{
 						"type": "object",
 						"properties": map[string]any{
 							"action": map[string]any{
 								"type":        "string",
 								"enum":        []string{"search", "docs"},
-								"description": "Action to perform: 'search' finds libraries matching a topic; 'docs' retrieves documentation and code examples for a specific library (requires 'library' parameter).",
+								"description": "Action to perform:\n  • 'search' — full-text search over cached docs; if none cached, falls back to Context7 API to find matching libraries\n  • 'docs' — fetch full docs + code examples for a specific library (requires 'library' parameter)",
 							},
 							"library": map[string]any{
 								"type":        "string",
-								"description": "Library name or Context7 ID (e.g. 'react', '/facebook/react'). Required for 'docs' action.",
+								"description": "Library name (e.g. 'lodash', 'fastapi') or Context7 ID (e.g. '/facebook/react'). **Required when action='docs'**; ignored when action='search'.",
 							},
 							"query": map[string]any{
 								"type":        "string",
-								"description": "Search query or documentation topic. Narrow queries return better results.",
+								"description": "Search query or documentation topic (e.g. 'error handling', 'deep merge'). Narrow, specific queries return better results.",
 							},
 						},
-						"required": []string{"action", "query"},
+						"required":             []string{"action", "query"},
 					},
 				})
 

@@ -1,6 +1,6 @@
 {
   "name": "zot-context7",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "exec": "go",
   "args": ["run", "."],
   "language": "go",
