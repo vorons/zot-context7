@@ -288,19 +288,33 @@ func (w *dbWrap) searchFTS(query string, limit int) ([]resultRow, error) {
 		// FTS query failed, fall through to LIKE
 	}
 
-	// Fallback: LIKE search
+	// Fallback: LIKE search (docs_fts only exists when FTS5 is available)
 	pat := "%" + safe + "%"
-	rows, err := w.Query(`SELECT library_name, library_id, title, content, query, 0.0 as rank
-		FROM docs_fts WHERE content LIKE ? OR title LIKE ? OR library_name LIKE ?
-		LIMIT ?`, pat, pat, pat, limit)
-	if err != nil {
-		// FTS table may not exist; search snippets directly
-		rows, err = w.Query(`SELECT '' as library_name, s.library_id, s.title, s.content, s.query, 0.0 as rank
-			FROM snippets s WHERE s.content LIKE ? OR s.title LIKE ? ORDER BY s.fetched_at DESC LIMIT ?`,
-			pat, pat, limit)
-		if err != nil {
-			return nil, err
+
+	if w.hasFTS {
+		rows, err := w.Query(`SELECT library_name, library_id, title, content, query, 0.0 as rank
+			FROM docs_fts WHERE content LIKE ? OR title LIKE ? OR library_name LIKE ?
+			LIMIT ?`, pat, pat, pat, limit)
+		if err == nil {
+			defer rows.Close()
+			var out []resultRow
+			for rows.Next() {
+				var r resultRow
+				if err := rows.Scan(&r.LibraryName, &r.LibraryID, &r.Title, &r.Content, &r.Query, &r.Rank); err != nil {
+					return nil, err
+				}
+				out = append(out, r)
+			}
+			return out, rows.Err()
 		}
+	}
+
+	// Final fallback: search snippets directly (works with or without FTS)
+	rows, err := w.Query(`SELECT '' as library_name, s.library_id, s.title, s.content, s.query, 0.0 as rank
+		FROM snippets s WHERE s.content LIKE ? OR s.title LIKE ? ORDER BY s.fetched_at DESC LIMIT ?`,
+		pat, pat, limit)
+	if err != nil {
+		return nil, err
 	}
 	defer rows.Close()
 
@@ -405,8 +419,7 @@ func (w *dbWrap) recordTokenStat(libraryID, query string, tokens int, cacheHit b
 		libraryID, query, tokens, hit, time.Now().UTC().Format(time.RFC3339))
 }
 
-// Rough estimate: ~$3/M input tokens for Claude.
-const tokenCostPerMillion = 3.0
+// token-cost constants removed — the estimate was hardcoded and model-specific
 
 type tokenStats struct {
 	TotalTokens      int     `json:"totalTokens"`
@@ -414,7 +427,6 @@ type tokenStats struct {
 	CacheHits        int     `json:"cacheHits"`
 	APICalls         int     `json:"apiCalls"`
 	HitRate          float64 `json:"hitRate"`
-	EstimatedSavings string  `json:"estimatedSavings"`
 }
 
 func (w *dbWrap) getTokenStats() *tokenStats {
@@ -434,15 +446,12 @@ func (w *dbWrap) getTokenStats() *tokenStats {
 		hitRate = float64(hits) / float64(totalCalls)
 	}
 
-	savedDollars := (float64(cachedTokens) / 1_000_000) * tokenCostPerMillion
-
 	return &tokenStats{
-		TotalTokens:      total,
-		CachedTokens:     cachedTokens,
-		CacheHits:        hits,
-		APICalls:         misses,
-		HitRate:          hitRate,
-		EstimatedSavings: fmt.Sprintf("$%.4f", savedDollars),
+		TotalTokens:  total,
+		CachedTokens: cachedTokens,
+		CacheHits:    hits,
+		APICalls:     misses,
+		HitRate:      hitRate,
 	}
 }
 
@@ -865,7 +874,7 @@ func handleLibs(ctx *commandCtx, args []string) {
 		}
 		id := l.ID
 		if len(id) > 30 {
-			id = id[:30]
+			id = id[:27] + "..."
 		}
 		score := 0.0
 		if l.BenchmarkScore != nil {
@@ -1068,7 +1077,6 @@ func handleCacheStats(ctx *commandCtx) {
 	b.WriteString(fmt.Sprintf("- **API calls:** %d\n", stats.APICalls))
 	b.WriteString(fmt.Sprintf("- **Cached tokens saved:** %d\n", stats.CachedTokens))
 	b.WriteString(fmt.Sprintf("- **Hit rate:** %.1f%%\n", stats.HitRate*100))
-	b.WriteString(fmt.Sprintf("- **Estimated savings:** %s\n", stats.EstimatedSavings))
 	ctx.respond(b.String())
 }
 
@@ -1408,7 +1416,7 @@ func main() {
 	emit(Frame{
 		"type":         "hello",
 		"name":         "zot-context7",
-		"version":      "1.2.0",
+		"version":      "1.2.1",
 		"capabilities": []string{"commands", "tools"},
 	})
 
@@ -1571,6 +1579,9 @@ func parseArgs(s string) []string {
 	}
 	if cur.Len() > 0 {
 		args = append(args, cur.String())
+	}
+	if inQuote {
+		notify("warn", "unclosed double quote in command")
 	}
 	return args
 }

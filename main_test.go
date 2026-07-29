@@ -215,6 +215,50 @@ func TestSnippets(t *testing.T) {
 	}
 }
 
+func TestSearchFTSLIKEFallback(t *testing.T) {
+	w := openTestDB(t)
+	defer w.Close()
+
+	// Force-disable FTS to exercise the LIKE → snippets fallback path
+	w.hasFTS = false
+
+	ss := []snippet{
+		{Title: "Error Handling", Content: "Use try/catch for error handling in JavaScript", SourceURL: "u1", Tokens: 10},
+		{Title: "Arrays", Content: "Array methods like map and filter", SourceURL: "u2", Tokens: 15},
+	}
+	w.storeSnippets("testlib", "/test/lib", "testing", ss)
+
+	// Search should find results via LIKE fallback on snippets
+	results, err := w.searchFTS("error", 10)
+	if err != nil {
+		t.Fatalf("searchFTS: %v", err)
+	}
+	if len(results) == 0 {
+		t.Fatal("expected results from LIKE fallback")
+	}
+	if results[0].LibraryID != "/test/lib" {
+		t.Errorf("LibraryID = %q, want /test/lib", results[0].LibraryID)
+	}
+
+	// Search for absent term
+	results, err = w.searchFTS("nonexistent", 10)
+	if err != nil {
+		t.Fatalf("searchFTS absent: %v", err)
+	}
+	if len(results) != 0 {
+		t.Errorf("expected 0 results, got %d", len(results))
+	}
+
+	// Empty safe query
+	results, err = w.searchFTS("''", 10)
+	if err != nil {
+		t.Fatalf("searchFTS empty: %v", err)
+	}
+	if results != nil {
+		t.Errorf("expected nil for empty query, got %d results", len(results))
+	}
+}
+
 func TestTokenStats(t *testing.T) {
 	w := openTestDB(t)
 	defer w.Close()
